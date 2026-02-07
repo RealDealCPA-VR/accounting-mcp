@@ -550,29 +550,90 @@ class TransactionManager:
         self,
         company_id: str,
         account_name: str,
-        bank_statement_path: str,
-        statement_date: str
+        bank_transactions: List[Dict[str, Any]],
+        statement_date: str,
+        start_date: str = None,
+        bank_ending_balance: float = 0.0,
+        date_tolerance_days: int = 3,
+        confidence_threshold: float = 0.75,
+        output_excel: str = None
     ) -> Dict[str, Any]:
         """
-        Auto-reconcile bank account.
+        Auto-reconcile bank account using fuzzy matching.
         
         Args:
             company_id: QuickBooks company ID
             account_name: Bank account name
-            bank_statement_path: Path to bank statement (PDF or CSV)
-            statement_date: Statement ending date
+            bank_transactions: List of bank statement transactions
+            statement_date: Statement ending date (YYYY-MM-DD)
+            start_date: Start date for QBO transactions (defaults to 30 days before statement_date)
+            bank_ending_balance: Ending balance per bank statement
+            date_tolerance_days: Days tolerance for date matching (default 3)
+            confidence_threshold: Minimum confidence for matches (default 0.75)
+            output_excel: Optional path to save Excel reconciliation report
             
         Returns:
-            Reconciliation results
+            Reconciliation results with matched/unmatched transactions
         """
+        from ..reconciliation.reconciler import BankReconciler, generate_reconciliation_excel
+        from datetime import datetime, timedelta
+        
         logger.info(f"Reconciling {account_name} for statement date {statement_date}")
         
-        # This would implement the reconciliation logic
-        # For now, return a placeholder
-        return {
-            'success': True,
-            'matched': 0,
-            'unmatched_qbo': 0,
-            'unmatched_bank': 0,
-            'message': 'Reconciliation feature coming soon'
-        }
+        try:
+            # Calculate start date if not provided (30 days before statement date)
+            if not start_date:
+                stmt_date = datetime.strptime(statement_date, '%Y-%m-%d')
+                start_date = (stmt_date - timedelta(days=30)).strftime('%Y-%m-%d')
+            
+            # Fetch QBO transactions for the period
+            qbo_transactions = await self.get_bank_transactions(
+                company_id=company_id,
+                account_name=account_name,
+                start_date=start_date,
+                end_date=statement_date
+            )
+            
+            logger.info(f"Retrieved {len(qbo_transactions)} QBO transactions")
+            logger.info(f"Received {len(bank_transactions)} bank transactions")
+            
+            # Initialize reconciler
+            reconciler = BankReconciler(
+                date_tolerance_days=date_tolerance_days,
+                confidence_threshold=confidence_threshold
+            )
+            
+            # Get QBO ending balance (simplified - sum of transactions)
+            qbo_ending_balance = sum(t.get('amount', 0) for t in qbo_transactions)
+            
+            # Perform reconciliation
+            report = reconciler.reconcile(
+                qbo_transactions=qbo_transactions,
+                bank_transactions=bank_transactions,
+                account_name=account_name,
+                statement_date=statement_date,
+                bank_ending_balance=bank_ending_balance,
+                qbo_ending_balance=qbo_ending_balance
+            )
+            
+            # Generate Excel report if requested
+            excel_path = None
+            if output_excel:
+                excel_path = generate_reconciliation_excel(report, output_excel)
+                logger.info(f"Reconciliation Excel saved to: {excel_path}")
+            
+            result = report.to_dict()
+            result['success'] = True
+            result['excel_report'] = excel_path
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error during reconciliation: {str(e)}")
+            return {
+                'success': False,
+                'error': str(e),
+                'matched': 0,
+                'unmatched_qbo': 0,
+                'unmatched_bank': 0
+            }

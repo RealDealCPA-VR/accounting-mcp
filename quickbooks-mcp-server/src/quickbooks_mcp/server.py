@@ -346,19 +346,30 @@ async def list_tools() -> list[Tool]:
             name="qbo_reconcile_bank",
             description=(
                 "Auto-reconcile bank account using fuzzy matching. "
-                "Matches QBO transactions with bank statement data. "
-                "Returns matched, unmatched, and discrepancy reports."
+                "Matches QBO transactions with bank statement transactions. "
+                "Use qbo_parse_pdf_transactions or qbo_import_csv_transactions first to extract bank transactions. "
+                "Returns matched, unmatched, and discrepancy reports with optional Excel export."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "account_name": {
                         "type": "string",
-                        "description": "Bank account name"
+                        "description": "Bank account name in QuickBooks"
                     },
-                    "bank_statement_path": {
-                        "type": "string",
-                        "description": "Path to bank statement (PDF or CSV)"
+                    "bank_transactions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "date": {"type": "string", "description": "Transaction date (YYYY-MM-DD)"},
+                                "amount": {"type": "number", "description": "Transaction amount"},
+                                "description": {"type": "string", "description": "Transaction description"},
+                                "reference": {"type": "string", "description": "Reference/check number (optional)"}
+                            },
+                            "required": ["date", "amount"]
+                        },
+                        "description": "Bank statement transactions (from PDF/CSV parser)"
                     },
                     "statement_date": {
                         "type": "string",
@@ -367,9 +378,29 @@ async def list_tools() -> list[Tool]:
                     "company_id": {
                         "type": "string",
                         "description": "QuickBooks company ID"
+                    },
+                    "start_date": {
+                        "type": "string",
+                        "description": "Start date for QBO transactions (optional, defaults to 30 days before statement_date)"
+                    },
+                    "bank_ending_balance": {
+                        "type": "number",
+                        "description": "Ending balance per bank statement (optional)"
+                    },
+                    "date_tolerance_days": {
+                        "type": "integer",
+                        "description": "Days tolerance for date matching (default: 3)"
+                    },
+                    "confidence_threshold": {
+                        "type": "number",
+                        "description": "Minimum confidence for matches 0-1 (default: 0.75)"
+                    },
+                    "output_excel": {
+                        "type": "string",
+                        "description": "Path to save Excel reconciliation report (optional)"
                     }
                 },
-                "required": ["account_name", "bank_statement_path", "statement_date", "company_id"]
+                "required": ["account_name", "bank_transactions", "statement_date", "company_id"]
             }
         ),
         
@@ -779,17 +810,56 @@ async def handle_get_bank_transactions(arguments: dict) -> Sequence[TextContent]
 
 
 async def handle_bank_reconciliation(arguments: dict) -> Sequence[TextContent]:
-    """Auto-reconcile bank account."""
+    """Auto-reconcile bank account using fuzzy matching."""
+    import json
+    
     company_id = arguments["company_id"]
     
     result = await transaction_manager.reconcile_bank(
         company_id=company_id,
         account_name=arguments["account_name"],
-        bank_statement_path=arguments["bank_statement_path"],
-        statement_date=arguments["statement_date"]
+        bank_transactions=arguments["bank_transactions"],
+        statement_date=arguments["statement_date"],
+        start_date=arguments.get("start_date"),
+        bank_ending_balance=arguments.get("bank_ending_balance", 0.0),
+        date_tolerance_days=arguments.get("date_tolerance_days", 3),
+        confidence_threshold=arguments.get("confidence_threshold", 0.75),
+        output_excel=arguments.get("output_excel")
     )
     
-    return [TextContent(type="text", text=str(result))]
+    # Format output nicely
+    if result.get('success'):
+        summary = result.get('summary', {})
+        output = f"""Bank Reconciliation Complete: {summary.get('account_name', 'Unknown')}
+Statement Date: {summary.get('statement_date', 'N/A')}
+
+📊 SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Bank Ending Balance:  ${summary.get('bank_ending_balance', 0):,.2f}
+QBO Ending Balance:   ${summary.get('qbo_ending_balance', 0):,.2f}
+Difference:           ${summary.get('difference', 0):,.2f}
+
+✅ Matched:           {summary.get('matched_count', 0)} transactions (${summary.get('matched_amount', 0):,.2f})
+⚠️ Unmatched QBO:     {summary.get('unmatched_qbo_count', 0)} transactions (${summary.get('unmatched_qbo_amount', 0):,.2f})
+⚠️ Unmatched Bank:    {summary.get('unmatched_bank_count', 0)} transactions (${summary.get('unmatched_bank_amount', 0):,.2f})
+
+Status: {"✅ RECONCILED" if summary.get('is_reconciled') else "❌ DISCREPANCIES FOUND"}
+"""
+        if result.get('excel_report'):
+            output += f"\n📄 Excel Report: {result['excel_report']}"
+        
+        if result.get('discrepancies'):
+            output += f"\n\n⚠️ DISCREPANCIES ({len(result['discrepancies'])} issues):\n"
+            for disc in result['discrepancies'][:5]:
+                output += f"  • [{disc['severity'].upper()}] {disc['message']}\n"
+            if len(result['discrepancies']) > 5:
+                output += f"  ... and {len(result['discrepancies']) - 5} more\n"
+        
+        output += f"\n\nFull details:\n{json.dumps(result, indent=2, default=str)}"
+    else:
+        output = f"Reconciliation failed: {result.get('error', 'Unknown error')}"
+    
+    return [TextContent(type="text", text=output)]
 
 
 async def handle_generate_tax_report(arguments: dict) -> Sequence[TextContent]:
